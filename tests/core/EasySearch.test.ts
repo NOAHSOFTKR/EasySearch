@@ -201,6 +201,21 @@ describe("search modes", () => {
     expect(ids(await es.search("검색 노아"))).toEqual([3]); // title + author.name
   });
 
+  it("reports single words of a multi-word query as word matches", async () => {
+    const people = new EasySearch({ data: [{ first: "John", last: "Smith" }], keys: ["first", "last"] });
+    const [result] = await people.search("john smith");
+    expect(result?.matches).toEqual([
+      { key: "first", type: "word" },
+      { key: "last", type: "word" },
+    ]);
+  });
+
+  it("ignores lone surrogates in queries", async () => {
+    const search = new EasySearch({ data: [{ t: "I 😀 you" }], keys: ["t"] });
+    expect(await search.search("\ud83d")).toEqual([]);
+    expect(await search.search("😀")).toHaveLength(1);
+  });
+
   it("supports fuzzy words inside multi-word queries", async () => {
     expect(ids(await es.search("검섹 라이브러리", { mode: "fuzzy" }))).toEqual([3]);
   });
@@ -359,6 +374,14 @@ describe("ranking, sorting and limits", () => {
     await expect(es.search("니아", { sort: "date" as "original" })).rejects.toThrow(/unknown sort/);
     await expect(es.search("니아", { maxEdits: -1 })).rejects.toThrow(RangeError);
     await expect(es.search(42 as unknown as string)).rejects.toThrow(TypeError);
+    await expect(es.search("니아", null as never)).rejects.toThrow(/options must be an object/);
+  });
+
+  it("rejects unknown keys before loading data", async () => {
+    const load = vi.fn(async () => posts);
+    const search = new EasySearch({ data: load, keys: ["title"] });
+    await expect(search.search("니아", { keys: ["content" as "title"] })).rejects.toThrow(/not a configured key/);
+    expect(load).not.toHaveBeenCalled();
   });
 });
 
@@ -445,6 +468,16 @@ describe("concurrency", () => {
     expect(ids(await es.search("니아"))).toEqual([2]);
   });
 
+  it("a search whose load failed gets the data of a newer successful load", async () => {
+    const failing = deferred<Post[]>();
+    const load = vi.fn<() => Promise<Post[]>>().mockReturnValueOnce(failing.promise).mockResolvedValue(posts);
+    const es = new EasySearch({ data: load, keys: ["title"] });
+    const early = es.search("니아");
+    await es.reload();
+    failing.reject(new Error("timeout"));
+    expect(ids(await early)).toEqual([2]);
+  });
+
   it("a search after invalidate() does not reuse a load that started before it", async () => {
     const before = deferred<Post[]>();
     const load = vi.fn<() => Promise<Post[]>>().mockReturnValueOnce(before.promise).mockResolvedValue(posts);
@@ -500,6 +533,7 @@ describe("lifecycle and validation", () => {
     expect(() => new EasySearch({ data: posts, advancedSettings: { cacheKey: "" } })).toThrow(/cacheKey/);
     expect(() => new EasySearch({ data: posts, advancedSettings: { cacheKey: "a\nb" } })).toThrow(/cacheKey/);
     expect(() => new EasySearch({ data: posts, advancedSettings: { cache: {} as never } })).toThrow(/CacheStack/);
+    expect(() => new EasySearch({ data: posts, advancedSettings: { idKey: 5 as never } })).toThrow(/idKey must be a string/);
   });
 
   it("cannot be used after dispose()", async () => {

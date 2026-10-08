@@ -19,6 +19,9 @@ const FUZZY_PREFIX_FACTOR = 0.75;
 /** Fuzzy prefix matching needs a query this long (in fuzzy code points) to avoid noise. */
 const FUZZY_PREFIX_MIN_LENGTH = 5;
 
+/** Lowest score of a word-start match: the strongest type reported for single words of a multi-word query. */
+export const WORD_MATCH_SCORE = WORD_BASE;
+
 /** Lowest score of a substring match. Every fuzzy score is below it. */
 export const SUBSTRING_MIN_SCORE = PARTIAL_BASE;
 

@@ -1,6 +1,7 @@
 import {
   FuzzyMatcher,
   SUBSTRING_MIN_SCORE,
+  WORD_MATCH_SCORE,
   defaultMaxEdits,
   fieldScore,
   fuzzyScore,
@@ -166,7 +167,8 @@ function matchWord(index: SearchIndex<unknown>, word: string, query: EngineQuery
   }
 
   // Pass 1: matching words of the vocabulary. A similarity of 0 marks a substring match.
-  const { terms, termCodes, postings } = index;
+  const { terms, postings } = index;
+  const termCodes = fuzzy ? index.termCodes : [];
   const matchedTerms: number[] = [];
   const similarities: number[] = [];
   let expectedEntries = 0;
@@ -264,14 +266,15 @@ export function executeQuery(index: SearchIndex<unknown>, query: EngineQuery): Q
     const phraseScore = phrase.has(doc) ? scorer.combine(phrase, doc) : 0;
     return { doc, score: round(Math.max(phraseScore, wordScore)) };
   });
-  // Per key: the phrase match if there is one, otherwise the best word match.
+  // Per key: the phrase match if there is one, otherwise the best single-word match. A single
+  // word equal to or starting a value is reported as "word": "exact"/"prefix" refer to the whole query.
   const matches = (doc: number): HitMatches =>
     scorer.matches((key) => {
       const phraseScore = phrase.get(doc, key);
       if (phraseScore > 0) return phraseScore;
       let best = 0;
       for (const scores of perWord) best = Math.max(best, scores.get(doc, key));
-      return best;
+      return Math.min(best, WORD_MATCH_SCORE);
     });
   return { hits, matches };
 }

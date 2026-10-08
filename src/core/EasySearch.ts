@@ -6,7 +6,7 @@ import {
   toKeySegment,
 } from "../cache/CacheAdapter.js";
 import { createDefaultLayerCache } from "../cache/LayerCacheAdapter.js";
-import { type ResolvedProvider, resolveProvider } from "../providers/DataProvider.js";
+import { DataLoadError, type ResolvedProvider, resolveProvider } from "../providers/DataProvider.js";
 import { normalizeText } from "../search/normalize.js";
 import type { AdvancedSettings, EasySearchOptions, SearchKey, SearchMode, SearchOptions } from "../types/options.js";
 import type { SearchResult } from "../types/results.js";
@@ -27,13 +27,24 @@ interface DataPayload<T> {
 interface Snapshot<T> {
   version: string;
   index: SearchIndex<T>;
+  /**
+   * Fingerprint of the indexed items (count, keys, positions). Instances that
+   * read the same data version through a serializing cache layer may index a
+   * different representation (e.g. after JSON round-trips), so cached result
+   * positions are only shared between identical indexes.
+   */
+  digest: string;
 }
 
 interface InFlightLoad<T> {
+  seq: number;
   /** `invalidate()` count when the load started. Searches only join loads of the current epoch. */
   epoch: number;
   promise: Promise<Snapshot<T>>;
 }
+
+/** Bump when the scoring or the cached result format changes, so old cached results are not reused. */
+const RESULT_FORMAT = "1";
 
 /** A ranked search result before it is joined with the data, also the cached form: `[item position, score, matches]`. */
 type RankedHit = [number, number, HitMatches];
@@ -97,7 +108,7 @@ function isRankedHits(value: unknown, size: number, keyCount: number): value is 
       Number.isInteger(hit[0]) &&
       hit[0] >= 0 &&
       hit[0] < size &&
-      typeof hit[1] === "number" &&
+      Number.isFinite(hit[1]) &&
       Array.isArray(hit[2]) &&
       (hit[2] as unknown[]).every(
         (match) =>
@@ -137,6 +148,12 @@ export class EasySearch<T> {
   private cachePromise: Promise<LayerCacheLike> | undefined;
   private ownsCache = false;
   private disposed = false;
+  /**
+   * Set by `invalidate()`: the next load must come from the data source, not
+   * from the cache. A read-through `cache.get()` could join a fetch that
+   * started before the invalidation and return the outdated data.
+   */
+  private bypassCachedData = false;
 
   constructor(options: EasySearchOptions<T>) {
     if (options === null || typeof options !== "object") {
@@ -146,6 +163,9 @@ export class EasySearch<T> {
     this.configuredKeys = resolveKeys(options.keys);
     const settings = options.advancedSettings ?? {};
     this.settings = settings;
+    if (settings.idKey !== undefined && typeof settings.idKey !== "string") {
+      throw new TypeError("EasySearch: advancedSettings.idKey must be a string.");
+    }
     this.idPath = settings.idKey === undefined ? undefined : parsePath(settings.idKey, "idKey");
 
     if (settings.cache !== undefined && (settings.cache === null || typeof settings.cache.get !== "function")) {
@@ -188,9 +208,13 @@ export class EasySearch<T> {
    *
    * A query that is empty after normalization returns `[]` without loading.
    */
-  async search(query: string, options: SearchOptions<T> = {}): Promise<SearchResult<T>[]> {
+  async search(query: string, searchOptions?: SearchOptions<T>): Promise<SearchResult<T>[]> {
     this.assertUsable();
     if (typeof query !== "string") throw new TypeError("EasySearch: the query must be a string.");
+    if (searchOptions !== undefined && (searchOptions === null || typeof searchOptions !== "object")) {
+      throw new TypeError("EasySearch: search options must be an object.");
+    }
+    const options = searchOptions ?? {};
     const mode = options.mode ?? "partial";
     if (!MODES.includes(mode)) throw new RangeError(`EasySearch: unknown search mode "${String(mode)}".`);
     const { limit, maxEdits, sort = "relevance", filter } = options;
@@ -206,13 +230,15 @@ export class EasySearch<T> {
     if (filter !== undefined && typeof filter !== "function") {
       throw new TypeError("EasySearch: `filter` must be a function.");
     }
+    // Configured keys are known up front: reject unknown ones before loading any data.
+    if (options.keys !== undefined && this.configuredKeys) this.resolveActiveKeys(this.configuredKeys, options.keys);
 
     const text = normalizeText(query, { ignoreDiacritics: this.settings.ignoreDiacritics === true });
     if (text === "" || limit === 0) return [];
 
     const snapshot = await this.acquireSnapshot();
     const index = snapshot.index;
-    const activeKeys = this.resolveActiveKeys(index, options.keys);
+    const activeKeys = this.resolveActiveKeys(index.keys, options.keys);
     if (activeKeys.length === 0) return [];
     const engineQuery = { text, mode, activeKeys, maxEdits };
 
@@ -255,6 +281,7 @@ export class EasySearch<T> {
     this.assertUsable();
     this.epoch++;
     this.stale = true;
+    if (this.cacheEnabled && !this.provider.isStatic) this.bypassCachedData = true;
     if (!this.cacheEnabled) return;
     const cache = await this.getCache();
     await Promise.all([cache.delete(this.dataKey()), cache.invalidateByTag(this.cacheTag)]);
@@ -280,12 +307,12 @@ export class EasySearch<T> {
     if (this.disposed) throw new Error("EasySearch: this instance has been disposed.");
   }
 
-  private resolveActiveKeys(index: SearchIndex<T>, keys: readonly string[] | undefined): number[] {
-    if (keys === undefined) return index.keys.map((_, i) => i);
+  private resolveActiveKeys(indexKeys: readonly ResolvedKey[], keys: readonly string[] | undefined): number[] {
+    if (keys === undefined) return indexKeys.map((_, i) => i);
     if (!Array.isArray(keys)) throw new TypeError("EasySearch: `keys` must be an array.");
     const active = new Set<number>();
     for (const name of keys) {
-      const position = index.keys.findIndex((key) => key.name === name);
+      const position = indexKeys.findIndex((key) => key.name === name);
       if (position === -1) throw new RangeError(`EasySearch: "${String(name)}" is not a configured key.`);
       active.add(position);
     }
@@ -306,10 +333,12 @@ export class EasySearch<T> {
   private async acquireSnapshot(): Promise<Snapshot<T>> {
     if (!this.settings.reloadOnSearch && this.snapshot && !this.stale) return this.snapshot;
     const inFlight = this.inFlight;
-    const load = inFlight && inFlight.epoch === this.epoch ? inFlight : this.startLoad(false);
+    const load = inFlight && inFlight.epoch === this.epoch ? inFlight : this.startLoad(this.bypassCachedData);
     try {
       return await load.promise;
     } catch (error) {
+      // A newer load (e.g. `reload()`) succeeded meanwhile: its data is current.
+      if (this.snapshot && !this.stale && this.installedSeq > load.seq) return this.snapshot;
       if (this.settings.fallbackToStaleOnError && this.snapshot) {
         this.report(error);
         return this.snapshot;
@@ -325,8 +354,11 @@ export class EasySearch<T> {
   private startLoad(force: boolean): InFlightLoad<T> {
     const seq = ++this.loadSeq;
     const epoch = this.epoch;
-    const promise = this.loadPayload(force).then((payload) => this.install(seq, epoch, payload));
-    const load: InFlightLoad<T> = { epoch, promise };
+    const promise = this.loadPayload(force).then((payload) => {
+      if (force && epoch === this.epoch) this.bypassCachedData = false;
+      return this.install(seq, epoch, payload);
+    });
+    const load: InFlightLoad<T> = { seq, epoch, promise };
     this.inFlight = load;
     promise.then(
       () => this.clearInFlight(load),
@@ -349,7 +381,8 @@ export class EasySearch<T> {
         idPath: this.idPath,
         ignoreDiacritics: this.settings.ignoreDiacritics === true,
       });
-      snapshot = { version: payload.version, index };
+      const digest = hashString(`${index.keys.map((key) => key.name).join("\u0000")}|${index.refIndexes.join(",")}`);
+      snapshot = { version: payload.version, index, digest };
     }
     this.snapshot = snapshot;
     this.installedSeq = seq;
@@ -370,14 +403,24 @@ export class EasySearch<T> {
     const key = this.dataKey();
     const entryOptions = this.entryOptions();
 
-    if (force) {
-      const payload = await fromSource();
+    const store = async (payload: DataPayload<T>): Promise<DataPayload<T>> => {
       try {
         await cache.set(key, payload, entryOptions);
       } catch (error) {
         this.report(error);
       }
       return payload;
+    };
+
+    if (force) {
+      // Deleting first fences read-through writes of loads that started earlier, so they
+      // cannot overwrite the fresh data in the cache when their source call finishes last.
+      try {
+        await cache.delete(key);
+      } catch (error) {
+        this.report(error);
+      }
+      return store(await fromSource());
     }
 
     let sourceFailed = false;
@@ -395,9 +438,11 @@ export class EasySearch<T> {
         entryOptions,
       );
       if (isPayload(payload)) return payload as DataPayload<T>;
-      this.report(new Error(`EasySearch: ignoring malformed cache entry "${key}".`));
+      this.report(new Error(`EasySearch: replacing malformed cache entry "${key}".`));
+      return store(await fromSource());
     } catch (error) {
-      if (sourceFailed) throw error;
+      // Data source errors (also from a fetch shared with another caller) are not cache failures.
+      if (sourceFailed || error instanceof DataLoadError) throw error;
       // The cache failed, not the data source: search without it.
       this.report(error);
     }
@@ -407,6 +452,8 @@ export class EasySearch<T> {
   // ------------------------------------------------------------------ cache
 
   private getCache(): Promise<LayerCacheLike> {
+    // Never (re)create a cache for a disposed instance: nothing would disconnect it.
+    if (this.disposed) return Promise.reject(new Error("EasySearch: this instance has been disposed."));
     if (!this.cachePromise) {
       const injected = this.settings.cache;
       if (injected) {
@@ -445,10 +492,10 @@ export class EasySearch<T> {
   ): Promise<RankedHit[]> {
     // Without a cached data load, `reloadOnSearch` creates a new version per search: results would never be reused.
     const versionIsStable = !this.settings.reloadOnSearch || !this.provider.isStatic;
-    if (!this.cacheEnabled || !versionIsStable) return compute();
+    if (!this.cacheEnabled || !versionIsStable || this.disposed) return compute();
 
     const signature = toKeySegment([query.mode, query.activeKeys, query.maxEdits ?? null, sort, limit ?? null, query.text]);
-    const key = `${this.cachePrefix}:result:${this.configFingerprint}:${snapshot.version}:${signature}`;
+    const key = `${this.cachePrefix}:result:${RESULT_FORMAT}:${this.configFingerprint}:${snapshot.version}:${snapshot.digest}:${signature}`;
     if (key.length > MAX_CACHE_KEY_LENGTH) return compute();
 
     const index = snapshot.index;
@@ -457,7 +504,10 @@ export class EasySearch<T> {
     try {
       const cached = await cache.get<RankedHit[]>(key, async () => compute(), this.entryOptions());
       if (isRankedHits(cached, index.size, index.keyCount)) return cached;
-      this.report(new Error(`EasySearch: ignoring malformed cache entry "${key}".`));
+      this.report(new Error(`EasySearch: replacing malformed cache entry "${key}".`));
+      const hits = compute();
+      await cache.set(key, hits, this.entryOptions());
+      return hits;
     } catch (error) {
       this.report(error);
     }

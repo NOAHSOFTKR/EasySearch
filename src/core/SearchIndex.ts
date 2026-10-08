@@ -86,7 +86,7 @@ export class SearchIndex<T> {
   readonly keyCount: number;
   private readonly values: FieldValues[];
   readonly terms: readonly string[];
-  readonly termCodes: readonly (readonly number[])[];
+  private fuzzyCodes: (readonly number[])[] | undefined;
   /** Pair ids (`item * keyCount + key`) per term, ascending and unique. */
   readonly postings: readonly (readonly number[])[];
   private exactMaps: Map<string, number[]>[] | undefined;
@@ -157,8 +157,13 @@ export class SearchIndex<T> {
     this.keyCount = keyCount;
     this.values = values;
     this.terms = terms;
-    this.termCodes = terms.map(toFuzzyCodes);
     this.postings = postings;
+  }
+
+  /** Fuzzy comparison codes per term, built on the first fuzzy search. */
+  get termCodes(): readonly (readonly number[])[] {
+    if (!this.fuzzyCodes) this.fuzzyCodes = this.terms.map(toFuzzyCodes);
+    return this.fuzzyCodes;
   }
 
   get size(): number {

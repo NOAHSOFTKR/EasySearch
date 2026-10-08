@@ -7,6 +7,12 @@ const COMBINING_MARKS = /\p{M}/gu;
 /** ASCII and precomposed Hangul syllables are already in NFKC form. */
 const NFKC_STABLE = /^[\u0000-\u007f\uac00-\ud7a3]*$/;
 const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+function isWellFormed(text: string): boolean {
+  // String.prototype.isWellFormed exists in Node.js 20+, but is not in the ES2022 type library.
+  return (text as unknown as { isWellFormed(): boolean }).isWellFormed();
+}
 
 /**
  * Normalizes text for matching: Unicode NFKC (composes Hangul jamo, folds
@@ -15,6 +21,8 @@ const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
  */
 export function normalizeText(value: string, options: NormalizeOptions): string {
   let text = (NFKC_STABLE.test(value) ? value : value.normalize("NFKC")).toLowerCase();
+  // Lone surrogates are not characters: drop them so they cannot match halves of emoji.
+  if (!isWellFormed(text)) text = text.replace(LONE_SURROGATE, "");
   if (options.ignoreDiacritics) {
     // NFD splits Hangul syllables into conjoining jamo (letters, not marks), so recompose afterwards.
     text = text.normalize("NFD").replace(COMBINING_MARKS, "").normalize("NFC");

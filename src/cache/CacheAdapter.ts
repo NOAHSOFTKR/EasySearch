@@ -27,13 +27,17 @@ export interface LayerCacheLike {
 /** LayerCache rejects longer keys (`MAX_CACHE_KEY_LENGTH` in layercache 5.x). */
 export const MAX_CACHE_KEY_LENGTH = 1024;
 
-/** Escapes a value so it can be embedded in a cache key without control characters or lone surrogates. */
+/** Escapes a value so it can be embedded in a cache key without control characters or surrogates. */
 export function toKeySegment(value: unknown): string {
-  // JSON.stringify escapes U+0000-U+001F and lone surrogates; DEL (U+007F) must be escaped by hand.
-  return JSON.stringify(value).replace(/\u007f/g, "\\u007f");
+  // JSON.stringify escapes U+0000-U+001F and lone surrogates. LayerCache also rejects DEL and
+  // every surrogate code unit, including valid pairs (emoji), so escape those by hand.
+  return JSON.stringify(value).replace(
+    /[\u007f\ud800-\udfff]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 }
 
-/** Small non-cryptographic 53-bit string hash (cyrb53), used only for configuration fingerprints. */
+/** Small non-cryptographic 53-bit string hash (cyrb53) for configuration and index fingerprints. */
 export function hashString(input: string): string {
   let h1 = 0xdeadbeef;
   let h2 = 0x41c6ce57;

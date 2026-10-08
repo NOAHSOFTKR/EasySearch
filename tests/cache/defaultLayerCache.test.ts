@@ -32,6 +32,16 @@ describe("useLayerCache: true without a custom cache", () => {
     expect(disconnect).toHaveBeenCalledTimes(1);
   });
 
+  it("does not create a new cache for a search that was running during dispose()", async () => {
+    const es = new EasySearch({ data: ["abc"], advancedSettings: { useLayerCache: true } });
+    await es.search("a");
+    const before = created.length;
+    const running = es.search("ab");
+    await es.dispose();
+    expect(await running).toHaveLength(1);
+    expect(created.length).toBe(before);
+  });
+
   it("does not load layercache when caching is disabled", async () => {
     const before = created.length;
     const es = new EasySearch({ data: [{ title: "니아" }], keys: ["title"] });

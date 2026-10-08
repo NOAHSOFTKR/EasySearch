@@ -122,7 +122,9 @@ Ranking within one field: exact > prefix > word start > substring > fuzzy, with
 shorter values ranking higher inside each level. An item's score is its best
 weighted field plus 10% of its other matching fields. Equal scores keep the data
 order. Multi-word queries require every word to match (in any field); a match of
-the whole phrase ranks above matches of the separate words.
+the whole phrase ranks above matches of the separate words. `exact` and `prefix`
+in `matches` describe the whole query, so a field matched by only one word of a
+multi-word query is reported as `word`.
 
 Text is compared after Unicode NFKC normalization and lower-casing, so
 `"ＴＴＳ"`, `"tts"` and `"TTS"` match each other and decomposed (NFD) Hangul
@@ -136,8 +138,9 @@ A query that is empty after normalization returns `[]`.
 
 ```ts
 await es.search("니아"); // loads on first use, then reuses the index
-await es.reload();       // calls the data source again (bypassing the cache) and rebuilds the index
-await es.invalidate();   // marks data invalid and deletes this instance's cache entries; next search reloads
+await es.reload();       // calls the data source again (bypassing the cache), writes the cache, rebuilds the index
+await es.invalidate();   // marks data invalid and deletes this instance's cache entries; the next search
+                         // loads from the data source (not from the cache)
 ```
 
 | `advancedSettings` | default | meaning |
@@ -202,8 +205,9 @@ How it stays consistent:
 
 - Every load from the data source gets a new data version, and result keys
   contain it. New data never returns old results.
-- Result keys also contain the search options and a fingerprint of the key
-  configuration, so different options never share results.
+- Result keys also contain the search options, a fingerprint of the key
+  configuration and a fingerprint of the built index, so different options or
+  differently built indexes never share results.
 - Concurrent identical searches are computed once (LayerCache stampede prevention).
 - Static arrays only cache results (there is nothing to gain from caching the array).
 - `filter` functions and custom `sort` comparators bypass the result cache.

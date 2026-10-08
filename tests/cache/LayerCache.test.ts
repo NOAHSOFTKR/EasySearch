@@ -42,6 +42,17 @@ function recordFetches(cache: CacheStack): string[] {
 }
 
 const isResultKey = (key: string) => key.includes(":result:");
+const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+function deferred<V>() {
+  let resolve!: (value: V) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<V>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 const isDataKey = (key: string) => key.endsWith(":data");
 
 afterEach(async () => {
@@ -327,6 +338,107 @@ describe("cache failures", () => {
     expect((await es.search("니아")).map((r) => r.item.id)).toEqual([4, 2]);
     expect(load).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("malformed") }));
+    // The entry is replaced, so the next instance reads valid data from the cache.
+    const loadB = vi.fn(async () => posts);
+    const b = new EasySearch({ data: loadB, keys: ["title"], advancedSettings: { cache, cacheKey: "posts" } });
+    expect((await b.search("니아")).map((r) => r.item.id)).toEqual([4, 2]);
+    expect(loadB).not.toHaveBeenCalled();
+  });
+
+  it("does not call the source again when a shared fetch failed in another instance", async () => {
+    const cache = memoryStack();
+    const gate = deferred<Post[]>();
+    const loadA = vi.fn(() => gate.promise);
+    const loadB = vi.fn(async () => posts);
+    const settings = { cache, cacheKey: "posts", onError: vi.fn() };
+    const a = new EasySearch({ data: loadA, keys: ["title"], advancedSettings: settings });
+    const b = new EasySearch({ data: loadB, keys: ["title"], advancedSettings: settings });
+    const searchA = a.search("니아");
+    await tick();
+    const searchB = b.search("니아"); // joins A's in-flight fetch (stampede prevention)
+    gate.reject(new Error("db down"));
+    await expect(searchA).rejects.toThrow(/failed to load/);
+    await expect(searchB).rejects.toThrow(/failed to load/);
+    expect(loadB).not.toHaveBeenCalled();
+    expect(settings.onError).not.toHaveBeenCalled();
+  });
+});
+
+describe("cache races", () => {
+  it("a search after invalidate() does not get data from a fetch that started before it", async () => {
+    const cache = memoryStack();
+    const before = deferred<Post[]>();
+    const load = vi.fn<() => Promise<Post[]>>().mockReturnValueOnce(before.promise).mockResolvedValue([{ id: 9, title: "니아 new" }]);
+    const es = new EasySearch({ data: load, keys: ["title"], advancedSettings: { cache } });
+    const early = es.search("니아");
+    await tick();
+    await es.invalidate();
+    const late = es.search("니아");
+    await tick();
+    before.resolve(posts);
+    await early;
+    expect((await late).map((r) => r.item.id)).toEqual([9]);
+    expect((await es.search("니아")).map((r) => r.item.id)).toEqual([9]);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it("an older load finishing after reload() does not overwrite the reloaded data in the cache", async () => {
+    const cache = memoryStack();
+    const old = deferred<Post[]>();
+    const load = vi.fn<() => Promise<Post[]>>().mockReturnValueOnce(old.promise).mockResolvedValue([{ id: 8, title: "니아 v2" }]);
+    const es = new EasySearch({ data: load, keys: ["title"], advancedSettings: { cache, reloadOnSearch: true } });
+    const early = es.search("니아");
+    await tick();
+    await es.reload();
+    old.resolve(posts);
+    expect((await early).map((r) => r.item.id)).toEqual([8]);
+    expect((await es.search("니아")).map((r) => r.item.id)).toEqual([8]);
+  });
+
+  it("caches queries containing emoji and other astral characters", async () => {
+    const cache = memoryStack();
+    const fetched = recordFetches(cache);
+    const onError = vi.fn();
+    const es = new EasySearch({ data: [{ t: "I 😀 you" }, { t: "𠀀 글자" }], keys: ["t"], advancedSettings: { cache, onError } });
+    expect(await es.search("😀")).toHaveLength(1);
+    expect(await es.search("😀")).toHaveLength(1);
+    expect(await es.search("𠀀")).toHaveLength(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(fetched.filter(isResultKey)).toHaveLength(2);
+  });
+
+  it("does not share cached results between indexes built from different representations of one data version", async () => {
+    // A serializing layer: values are JSON round-tripped, as with Redis or disk.
+    const store = new Map<string, string>();
+    const jsonCache: LayerCacheLike = {
+      async get<V>(key: string, fetcher?: () => Promise<V>) {
+        const hit = store.get(key);
+        if (hit !== undefined) return JSON.parse(hit) as V;
+        if (!fetcher) return undefined;
+        const value = await fetcher();
+        store.set(key, JSON.stringify(value));
+        return value;
+      },
+      async set(key, value) {
+        store.set(key, JSON.stringify(value));
+      },
+      async delete(key) {
+        store.delete(key);
+      },
+      async invalidateByTag() {},
+    };
+    const day = (d: number) => new Date(Date.UTC(2026, 0, d));
+    // Date ids are not indexed values for the loading instance, but ISO strings after the round trip.
+    const load = async () => [
+      { id: day(1) as Date | string, name: "alpha" },
+      { id: day(1) as Date | string, name: "bravo" },
+      { id: day(2) as Date | string, name: "charlie" },
+    ];
+    const settings = { cache: jsonCache, cacheKey: "shared", idKey: "id" as const };
+    const podA = new EasySearch({ data: load, keys: ["name"], advancedSettings: settings });
+    expect((await podA.search("bravo")).map((r) => r.item.name)).toEqual(["bravo"]);
+    const podB = new EasySearch({ data: load, keys: ["name"], advancedSettings: settings });
+    expect((await podB.search("bravo")).map((r) => r.item.name)).toEqual([]); // "bravo" is a duplicate id in B
   });
 });
 
