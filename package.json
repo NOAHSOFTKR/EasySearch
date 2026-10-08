@@ -1,0 +1,82 @@
+{
+  "name": "@noahsoft/easy-search",
+  "version": "0.1.0",
+  "description": "Lightweight TypeScript search library: register a data source, search it with exact, partial and fuzzy matching, and optionally cache through LayerCache.",
+  "keywords": [
+    "search",
+    "fuzzy-search",
+    "full-text-search",
+    "korean",
+    "hangul",
+    "typescript",
+    "layercache",
+    "cache"
+  ],
+  "license": "MIT",
+  "author": "NOAHSOFT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NOAHSOFTKR/EasySearch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NOAHSOFTKR/EasySearch/issues"
+  },
+  "homepage": "https://github.com/NOAHSOFTKR/EasySearch#readme",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx bench/search.bench.ts",
+    "check:package": "publint && attw --pack . && node scripts/smoke-pack.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run check:package"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "layercache": ">=5.0.0 <6"
+  },
+  "peerDependenciesMeta": {
+    "layercache": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^22.20.5",
+    "layercache": "^5.0.0",
+    "publint": "^0.3.25",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.11"
+  }
+}
