@@ -58,3 +58,28 @@ describe("toFuzzyCodes", () => {
     expect(toFuzzyCodes("😀a")).toHaveLength(2);
   });
 });
+
+describe("normalizeText fast paths", () => {
+  it("agrees with the plain regex/NFKC implementation", () => {
+    const reference = (value: string) => value.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+    const pieces = ["a", "B", " ", "  ", "\t", "\n", " ", "　", "﻿", "니아", "ＴＴＳ", "ﬁ", "é", "é", "😀", "Ⅻ", "x"];
+    let seed = 7;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed / 2147483648;
+    };
+    for (let n = 0; n < 3000; n++) {
+      let value = "";
+      const length = Math.floor(random() * 8);
+      for (let i = 0; i < length; i++) value += pieces[Math.floor(random() * pieces.length)];
+      expect(normalizeText(value, plain)).toBe(reference(value));
+    }
+  });
+
+  it("tokenizes like the Unicode word regex", () => {
+    const reference = (text: string) => text.match(/[\p{L}\p{N}\p{M}]+/gu) ?? [];
+    for (const text of ["니아 tts-봇", "été ½ ²", "𠀀𠀁 x", "a\ud800b", "東京タワー", "١٢٣ عربي", "__init__"]) {
+      expect(tokenize(text)).toEqual(reference(text));
+    }
+  });
+});

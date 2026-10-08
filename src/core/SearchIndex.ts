@@ -41,6 +41,12 @@ function isSearchable(value: unknown): boolean {
   return false;
 }
 
+function addDoc(map: Map<string, number[]>, text: string, doc: number): void {
+  const list = map.get(text);
+  if (!list) map.set(text, [doc]);
+  else if (list[list.length - 1] !== doc) list.push(doc);
+}
+
 /** Keys used when none are configured: the item itself, or top-level searchable properties. */
 function discoverKeys(items: readonly unknown[]): ResolvedKey[] {
   const names = new Set<string>();
@@ -96,6 +102,19 @@ export class SearchIndex<T> {
     const postings: number[][] = [];
     const seenIds = options.idPath ? new Set<string>() : undefined;
     const raw: RawValue[] = [];
+    const addTerms = (text: string, pair: number): void => {
+      for (const term of tokenize(text)) {
+        let id = termIds.get(term);
+        if (id === undefined) {
+          id = terms.length;
+          termIds.set(term, id);
+          terms.push(term);
+          postings.push([]);
+        }
+        const list = postings[id] as number[];
+        if (list[list.length - 1] !== pair) list.push(pair);
+      }
+    };
 
     for (let ref = 0; ref < data.length; ref++) {
       const item = data[ref] as T;
@@ -127,19 +146,8 @@ export class SearchIndex<T> {
         if (field === undefined) continue;
 
         const pair = doc * keyCount + k;
-        for (const text of typeof field === "string" ? [field] : field) {
-          for (const term of tokenize(text)) {
-            let id = termIds.get(term);
-            if (id === undefined) {
-              id = terms.length;
-              termIds.set(term, id);
-              terms.push(term);
-              postings.push([]);
-            }
-            const list = postings[id] as number[];
-            if (list[list.length - 1] !== pair) list.push(pair);
-          }
-        }
+        if (typeof field === "string") addTerms(field, pair);
+        else for (const text of field) addTerms(text, pair);
       }
     }
 
@@ -175,11 +183,8 @@ export class SearchIndex<T> {
         const field = this.fieldValues(doc, k);
         if (field === undefined) continue;
         const map = maps[k] as Map<string, number[]>;
-        for (const text of typeof field === "string" ? [field] : field) {
-          const list = map.get(text);
-          if (!list) map.set(text, [doc]);
-          else if (list[list.length - 1] !== doc) list.push(doc);
-        }
+        if (typeof field === "string") addDoc(map, field, doc);
+        else for (const text of field) addDoc(map, text, doc);
       }
     }
     return maps;

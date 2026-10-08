@@ -1,16 +1,31 @@
-import { FuzzyMatcher, defaultMaxEdits, fuzzyScore, matchField, matchTypeOf } from "../search/matchers.js";
+import {
+  FuzzyMatcher,
+  SUBSTRING_MIN_SCORE,
+  defaultMaxEdits,
+  fieldScore,
+  fuzzyScore,
+  matchTypeOf,
+} from "../search/matchers.js";
 import { toFuzzyCodes, tokenize } from "../search/normalize.js";
 import type { SearchMode } from "../types/options.js";
 import type { MatchType } from "../types/results.js";
-import type { SearchIndex } from "./SearchIndex.js";
+import type { ResolvedKey, SearchIndex } from "./SearchIndex.js";
 
 /** A matched item before it is joined with the original data. */
 export interface Hit {
   /** Position in `SearchIndex.items`. */
   doc: number;
   score: number;
-  /** `[key index, match type]`, in key order. */
-  matches: [number, MatchType][];
+}
+
+/** `[key index, match type]` per matching key, in key order. */
+export type HitMatches = [number, MatchType][];
+
+export interface QueryResult {
+  /** Every matching item, unsorted. */
+  hits: Hit[];
+  /** Matching keys of one hit. Computed on demand, so only returned hits pay for it. */
+  matches(doc: number): HitMatches;
 }
 
 export interface EngineQuery {
@@ -26,24 +41,69 @@ export interface EngineQuery {
 const MULTI_FIELD_BONUS = 0.1;
 /** Multi-word queries matched word by word rank below the same words matched as a phrase. */
 const WORD_BY_WORD_FACTOR = 0.9;
-/** Marks a (item, key) pair whose value contains the query word, as opposed to a fuzzy similarity in (0, 1]. */
-const SUBSTRING = 2;
+/** Above `items / DENSE_THRESHOLD` expected entries, typed arrays are cheaper than a hash map. */
+const DENSE_THRESHOLD = 16;
 
 /** Scores are rounded so floating-point noise never decides an order (ties fall back to data order). */
 function round(score: number): number {
   return Math.round(score * 1e6) / 1e6;
 }
 
-/** Best raw field score per item and key (`0` = no match). */
-type FieldScores = Map<number, Float64Array>;
+/**
+ * Best field score per (item, key), `0` meaning no match. Small result sets
+ * use a map of per-item rows; large ones (e.g. one-letter queries) a flat
+ * typed array, which avoids a hash lookup and an allocation per item.
+ */
+class FieldScores {
+  /** Items with at least one score, in first-touch order. */
+  readonly docs: number[] = [];
+  private readonly dense: Float64Array | undefined;
+  private readonly seen: Uint8Array | undefined;
+  private readonly sparse: Map<number, Float64Array> | undefined;
 
-function setScore(scores: FieldScores, keyCount: number, doc: number, key: number, score: number): void {
-  let row = scores.get(doc);
-  if (!row) {
-    row = new Float64Array(keyCount);
-    scores.set(doc, row);
+  constructor(
+    private readonly keyCount: number,
+    itemCount: number,
+    expectedEntries: number,
+  ) {
+    if (expectedEntries * DENSE_THRESHOLD >= itemCount) {
+      this.dense = new Float64Array(itemCount * keyCount);
+      this.seen = new Uint8Array(itemCount);
+    } else {
+      this.sparse = new Map();
+    }
   }
-  if (score > (row[key] as number)) row[key] = score;
+
+  /** Raises the score of (doc, key) to `score` if it is higher. */
+  raise(doc: number, key: number, score: number): void {
+    if (this.dense) {
+      const seen = this.seen as Uint8Array;
+      if (seen[doc] === 0) {
+        seen[doc] = 1;
+        this.docs.push(doc);
+      }
+      const at = doc * this.keyCount + key;
+      if (score > (this.dense[at] as number)) this.dense[at] = score;
+      return;
+    }
+    const sparse = this.sparse as Map<number, Float64Array>;
+    let row = sparse.get(doc);
+    if (!row) {
+      row = new Float64Array(this.keyCount);
+      sparse.set(doc, row);
+      this.docs.push(doc);
+    }
+    if (score > (row[key] as number)) row[key] = score;
+  }
+
+  get(doc: number, key: number): number {
+    if (this.dense) return this.dense[doc * this.keyCount + key] as number;
+    return (this.sparse as Map<number, Float64Array>).get(doc)?.[key] ?? 0;
+  }
+
+  has(doc: number): boolean {
+    return this.dense ? this.seen?.[doc] === 1 : (this.sparse as Map<number, Float64Array>).has(doc);
+  }
 }
 
 class Scorer {
@@ -57,7 +117,7 @@ class Scorer {
     this.weights = new Float64Array(index.keyCount);
     let maxWeight = 0;
     for (const k of activeKeys) {
-      const weight = (index.keys[k] as { weight: number }).weight;
+      const weight = (index.keys[k] as ResolvedKey).weight;
       this.weights[k] = weight;
       if (weight > maxWeight) maxWeight = weight;
     }
@@ -65,30 +125,30 @@ class Scorer {
   }
 
   /** Best weighted field score plus a bonus for the other matching fields, scaled by the largest weight. */
-  combine(row: Float64Array): number {
+  combine(scores: FieldScores, doc: number): number {
     let best = 0;
     let sum = 0;
     for (const k of this.activeKeys) {
-      const weighted = (row[k] as number) * (this.weights[k] as number);
+      const weighted = scores.get(doc, k) * (this.weights[k] as number);
       sum += weighted;
       if (weighted > best) best = weighted;
     }
-    return round((best + MULTI_FIELD_BONUS * (sum - best)) / this.maxWeight);
+    return (best + MULTI_FIELD_BONUS * (sum - best)) / this.maxWeight;
   }
 
-  matches(row: Float64Array): [number, MatchType][] {
-    const matches: [number, MatchType][] = [];
+  /** Hits for every item in `scores`, with match types read from the same scores. */
+  result(scores: FieldScores): QueryResult {
+    const hits: Hit[] = scores.docs.map((doc) => ({ doc, score: round(this.combine(scores, doc)) }));
+    return { hits, matches: (doc) => this.matches((k) => scores.get(doc, k)) };
+  }
+
+  matches(scoreOf: (key: number) => number): HitMatches {
+    const matches: HitMatches = [];
     for (const k of this.activeKeys) {
-      const score = row[k] as number;
+      const score = scoreOf(k);
       if (score > 0) matches.push([k, matchTypeOf(score)]);
     }
     return matches;
-  }
-
-  hits(scores: FieldScores): Hit[] {
-    const hits: Hit[] = [];
-    for (const [doc, row] of scores) hits.push({ doc, score: this.combine(row), matches: this.matches(row) });
-    return hits;
   }
 }
 
@@ -105,116 +165,171 @@ function matchWord(index: SearchIndex<unknown>, word: string, query: EngineQuery
     if (matcher.enabled) fuzzy = matcher;
   }
 
-  const pairs = new Map<number, number>();
+  // Pass 1: matching words of the vocabulary. A similarity of 0 marks a substring match.
   const { terms, termCodes, postings } = index;
+  const matchedTerms: number[] = [];
+  const similarities: number[] = [];
+  let expectedEntries = 0;
   for (let t = 0; t < terms.length; t++) {
-    let mark: number;
-    if ((terms[t] as string).includes(word)) mark = SUBSTRING;
-    else if (fuzzy) {
-      mark = fuzzy.similarity(termCodes[t] as number[]);
-      if (mark === 0) continue;
-    } else continue;
-    for (const pair of postings[t] as number[]) {
-      if (active[pair % keyCount] === 0) continue;
-      if ((pairs.get(pair) ?? 0) < mark) pairs.set(pair, mark);
+    let similarity = 0;
+    if (!(terms[t] as string).includes(word)) {
+      if (!fuzzy) continue;
+      similarity = fuzzy.similarity(termCodes[t] as number[]);
+      if (similarity === 0) continue;
     }
+    matchedTerms.push(t);
+    similarities.push(similarity);
+    expectedEntries += (postings[t] as number[]).length;
   }
 
-  const scores: FieldScores = new Map();
-  for (const [pair, mark] of pairs) {
-    const key = pair % keyCount;
-    const doc = (pair - key) / keyCount;
-    if (mark === SUBSTRING) {
-      const values = index.fieldValues(doc, key);
-      const match = values === undefined ? undefined : matchField(values, word);
-      if (match) setScore(scores, keyCount, doc, key, match.score);
-    } else {
-      setScore(scores, keyCount, doc, key, fuzzyScore(mark));
+  // Pass 2: score the (item, key) pairs those words occur in.
+  const scores = new FieldScores(keyCount, index.size, expectedEntries);
+  for (let m = 0; m < matchedTerms.length; m++) {
+    const similarity = similarities[m] as number;
+    for (const pair of postings[matchedTerms[m] as number] as number[]) {
+      const key = pair % keyCount;
+      if (active[key] === 0) continue;
+      const doc = (pair - key) / keyCount;
+      if (similarity > 0) {
+        scores.raise(doc, key, fuzzyScore(similarity));
+      } else if (scores.get(doc, key) < SUBSTRING_MIN_SCORE) {
+        // Substring scores depend only on the field values: compute them once per pair.
+        const values = index.fieldValues(doc, key);
+        if (values !== undefined) scores.raise(doc, key, fieldScore(values, word));
+      }
     }
   }
   return scores;
 }
 
-/** Substring match of the whole query against every value. Used when the query has no words (e.g. "++"). */
-function scanPhrase(index: SearchIndex<unknown>, query: EngineQuery, docs: Iterable<number>): FieldScores {
-  const scores: FieldScores = new Map();
-  for (const doc of docs) {
+/** Substring match of the whole query against every value of the given items. */
+function scanPhrase(index: SearchIndex<unknown>, query: EngineQuery, docs: readonly number[] | undefined): FieldScores {
+  const count = docs ? docs.length : index.size;
+  const scores = new FieldScores(index.keyCount, index.size, count);
+  for (let i = 0; i < count; i++) {
+    const doc = docs ? (docs[i] as number) : i;
     for (const key of query.activeKeys) {
       const values = index.fieldValues(doc, key);
       if (values === undefined) continue;
-      const match = matchField(values, query.text);
-      if (match) setScore(scores, index.keyCount, doc, key, match.score);
+      const score = fieldScore(values, query.text);
+      if (score > 0) scores.raise(doc, key, score);
     }
   }
   return scores;
 }
 
-function* allDocs(size: number): Iterable<number> {
-  for (let doc = 0; doc < size; doc++) yield doc;
-}
-
 /**
- * Finds every item matching `query`. Results are unsorted.
+ * Finds every item matching `query`.
  *
  * - `exact`: whole-value lookups in the exact-value maps.
  * - one-word query: vocabulary scan for the word.
+ * - query without words (e.g. "++"): substring scan of every value.
  * - multi-word query: every word must match (in any searched field). The
  *   score is the better of the phrase match and the averaged word matches.
  */
-export function executeQuery(index: SearchIndex<unknown>, query: EngineQuery): Hit[] {
+export function executeQuery(index: SearchIndex<unknown>, query: EngineQuery): QueryResult {
   const scorer = new Scorer(index, query.activeKeys);
   const keyCount = index.keyCount;
 
   if (query.mode === "exact") {
-    const scores: FieldScores = new Map();
-    for (const key of query.activeKeys) {
-      for (const doc of index.exactMatches(key, query.text)) setScore(scores, keyCount, doc, key, 1);
-    }
-    return scorer.hits(scores);
+    const lists = query.activeKeys.map((key) => index.exactMatches(key, query.text));
+    const scores = new FieldScores(keyCount, index.size, lists.reduce((sum, list) => sum + list.length, 0));
+    query.activeKeys.forEach((key, i) => {
+      for (const doc of lists[i] as readonly number[]) scores.raise(doc, key, 1);
+    });
+    return scorer.result(scores);
   }
 
   const words = [...new Set(tokenize(query.text))];
-  if (words.length === 0) return scorer.hits(scanPhrase(index, query, allDocs(index.size)));
+  if (words.length === 0) return scorer.result(scanPhrase(index, query, undefined));
 
   const active = new Uint8Array(keyCount);
   for (const key of query.activeKeys) active[key] = 1;
 
   if (words.length === 1 && words[0] === query.text) {
-    return scorer.hits(matchWord(index, query.text, query, active));
+    return scorer.result(matchWord(index, query.text, query, active));
   }
 
   const perWord = words.map((word) => matchWord(index, word, query, active));
   // Iterate the smallest candidate set and require every other word to match too.
-  perWord.sort((a, b) => a.size - b.size);
+  perWord.sort((a, b) => a.docs.length - b.docs.length);
   const [smallest, ...others] = perWord as [FieldScores, ...FieldScores[]];
-  const candidates: number[] = [];
-  for (const doc of smallest.keys()) {
-    if (others.every((scores) => scores.has(doc))) candidates.push(doc);
-  }
-
+  const candidates = smallest.docs.filter((doc) => others.every((scores) => scores.has(doc)));
   const phrase = scanPhrase(index, query, candidates);
-  const hits: Hit[] = [];
-  for (const doc of candidates) {
+
+  const hits: Hit[] = candidates.map((doc) => {
     let wordTotal = 0;
-    const shown = new Float64Array(keyCount);
-    for (const scores of perWord) {
-      const row = scores.get(doc) as Float64Array;
-      wordTotal += scorer.combine(row);
-      for (const key of query.activeKeys) if ((row[key] as number) > (shown[key] as number)) shown[key] = row[key] as number;
-    }
+    for (const scores of perWord) wordTotal += scorer.combine(scores, doc);
     const wordScore = (WORD_BY_WORD_FACTOR * wordTotal) / perWord.length;
-    const phraseRow = phrase.get(doc);
-    const phraseScore = phraseRow ? scorer.combine(phraseRow) : 0;
-    if (phraseRow) {
-      for (const key of query.activeKeys) if ((phraseRow[key] as number) > 0) shown[key] = phraseRow[key] as number;
-    }
-    hits.push({ doc, score: round(Math.max(phraseScore, wordScore)), matches: scorer.matches(shown) });
-  }
-  return hits;
+    const phraseScore = phrase.has(doc) ? scorer.combine(phrase, doc) : 0;
+    return { doc, score: round(Math.max(phraseScore, wordScore)) };
+  });
+  // Per key: the phrase match if there is one, otherwise the best word match.
+  const matches = (doc: number): HitMatches =>
+    scorer.matches((key) => {
+      const phraseScore = phrase.get(doc, key);
+      if (phraseScore > 0) return phraseScore;
+      let best = 0;
+      for (const scores of perWord) best = Math.max(best, scores.get(doc, key));
+      return best;
+    });
+  return { hits, matches };
 }
 
-/** Sorts hits in place: by score (ties in data order) or by data order. */
-export function sortHits(hits: Hit[], order: "relevance" | "original"): Hit[] {
-  if (order === "original") return hits.sort((a, b) => a.doc - b.doc);
-  return hits.sort((a, b) => b.score - a.score || a.doc - b.doc);
+type HitOrder = (a: Hit, b: Hit) => number;
+
+const byRelevance: HitOrder = (a, b) => b.score - a.score || a.doc - b.doc;
+const byDataOrder: HitOrder = (a, b) => a.doc - b.doc;
+
+/**
+ * Orders hits by score (ties in data order) or by data order, keeping at
+ * most `limit`. A small limit uses a bounded heap (O(n log limit)) instead
+ * of sorting every hit.
+ */
+export function rankHits(hits: Hit[], order: "relevance" | "original", limit: number | undefined): Hit[] {
+  const compare = order === "original" ? byDataOrder : byRelevance;
+  if (limit === undefined || limit * 4 >= hits.length) {
+    hits.sort(compare);
+    return limit === undefined ? hits : hits.slice(0, limit);
+  }
+  return selectTop(hits, limit, compare);
+}
+
+/** The `limit` best hits in order, using a heap whose root is the worst hit kept so far. */
+function selectTop(hits: readonly Hit[], limit: number, compare: HitOrder): Hit[] {
+  const heap: Hit[] = [];
+  if (limit === 0) return heap;
+  // `compare(a, b) > 0` means `a` ranks after `b`; the root is the hit that ranks last.
+  const siftUp = (index: number): void => {
+    let i = index;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (compare(heap[i] as Hit, heap[parent] as Hit) <= 0) break;
+      [heap[i], heap[parent]] = [heap[parent] as Hit, heap[i] as Hit];
+      i = parent;
+    }
+  };
+  const siftDown = (): void => {
+    let i = 0;
+    for (;;) {
+      const left = 2 * i + 1;
+      const right = left + 1;
+      let worst = i;
+      if (left < heap.length && compare(heap[left] as Hit, heap[worst] as Hit) > 0) worst = left;
+      if (right < heap.length && compare(heap[right] as Hit, heap[worst] as Hit) > 0) worst = right;
+      if (worst === i) return;
+      [heap[i], heap[worst]] = [heap[worst] as Hit, heap[i] as Hit];
+      i = worst;
+    }
+  };
+  for (const hit of hits) {
+    if (heap.length < limit) {
+      heap.push(hit);
+      siftUp(heap.length - 1);
+    } else if (compare(hit, heap[0] as Hit) < 0) {
+      heap[0] = hit;
+      siftDown();
+    }
+  }
+  return heap.sort(compare);
 }

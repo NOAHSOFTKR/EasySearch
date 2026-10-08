@@ -19,34 +19,36 @@ const FUZZY_PREFIX_FACTOR = 0.75;
 /** Fuzzy prefix matching needs a query this long (in fuzzy code points) to avoid noise. */
 const FUZZY_PREFIX_MIN_LENGTH = 5;
 
-export interface FieldMatch {
-  type: MatchType;
-  score: number;
-}
+/** Lowest score of a substring match. Every fuzzy score is below it. */
+export const SUBSTRING_MIN_SCORE = PARTIAL_BASE;
 
-/** Exact, prefix, word-start or substring match of `query` in one normalized value. */
-export function matchSubstring(value: string, query: string): FieldMatch | undefined {
-  if (value === query) return { type: "exact", score: EXACT_SCORE };
+/**
+ * Score of an exact, prefix, word-start or substring match of `query` in one
+ * normalized value, or `0` when `value` does not contain `query`.
+ * Use {@link matchTypeOf} to get the match type.
+ */
+export function substringScore(value: string, query: string): number {
+  if (value === query) return EXACT_SCORE;
   let index = value.indexOf(query);
-  if (index === -1) return undefined;
+  if (index === -1) return 0;
   const coverage = (query.length / value.length) * COVERAGE_RANGE;
-  if (index === 0) return { type: "prefix", score: PREFIX_BASE + coverage };
+  if (index === 0) return PREFIX_BASE + coverage;
   while (index !== -1) {
-    if (isWordStart(value, index)) return { type: "word", score: WORD_BASE + coverage };
+    if (isWordStart(value, index)) return WORD_BASE + coverage;
     index = value.indexOf(query, index + 1);
   }
-  return { type: "partial", score: PARTIAL_BASE + coverage };
+  return PARTIAL_BASE + coverage;
 }
 
-/** Best substring match of `query` across the values of one field. */
-export function matchField(values: string | readonly string[], query: string): FieldMatch | undefined {
-  if (typeof values === "string") return matchSubstring(values, query);
-  let best: FieldMatch | undefined;
+/** Best {@link substringScore} of `query` across the values of one field. */
+export function fieldScore(values: string | readonly string[], query: string): number {
+  if (typeof values === "string") return substringScore(values, query);
+  let best = 0;
   for (const value of values) {
-    const match = matchSubstring(value, query);
-    if (match && (!best || match.score > best.score)) {
-      best = match;
-      if (best.type === "exact") break;
+    const score = substringScore(value, query);
+    if (score > best) {
+      best = score;
+      if (best === EXACT_SCORE) break;
     }
   }
   return best;
@@ -160,7 +162,7 @@ export class FuzzyMatcher {
   }
 }
 
-/** Match type of a field score. Score bands do not overlap, so the band identifies the type. */
+/** Match type of a positive field score. Score bands do not overlap, so the band identifies the type. */
 export function matchTypeOf(score: number): MatchType {
   if (score >= EXACT_SCORE) return "exact";
   if (score >= PREFIX_BASE) return "prefix";

@@ -2,31 +2,33 @@ import { describe, expect, it } from "vitest";
 import {
   FuzzyMatcher,
   defaultMaxEdits,
+  fieldScore,
   fuzzyScore,
-  matchField,
-  matchSubstring,
   matchTypeOf,
+  substringScore,
 } from "../../src/search/matchers.js";
 import { toFuzzyCodes } from "../../src/search/normalize.js";
 
-describe("matchSubstring", () => {
+const typeOf = (value: string, query: string) => matchTypeOf(substringScore(value, query));
+
+describe("substringScore", () => {
   it("classifies exact, prefix, word and partial matches", () => {
-    expect(matchSubstring("니아", "니아")?.type).toBe("exact");
-    expect(matchSubstring("니아 tts 봇", "니아")?.type).toBe("prefix");
-    expect(matchSubstring("디스코드 니아봇", "니아")?.type).toBe("word");
-    expect(matchSubstring("디스코드니아", "니아")?.type).toBe("partial");
-    expect(matchSubstring("검색", "니아")).toBeUndefined();
+    expect(typeOf("니아", "니아")).toBe("exact");
+    expect(typeOf("니아 tts 봇", "니아")).toBe("prefix");
+    expect(typeOf("디스코드 니아봇", "니아")).toBe("word");
+    expect(typeOf("디스코드니아", "니아")).toBe("partial");
+    expect(substringScore("검색", "니아")).toBe(0);
   });
 
   it("finds a word-start occurrence after an earlier in-word occurrence", () => {
-    expect(matchSubstring("abcat cat", "cat")?.type).toBe("word");
+    expect(typeOf("abcat cat", "cat")).toBe("word");
   });
 
   it("orders score bands exact > prefix > word > partial > fuzzy", () => {
-    const exact = matchSubstring("ab", "ab")?.score ?? 0;
-    const prefix = matchSubstring("ab".padEnd(3, "c"), "ab")?.score ?? 0;
-    const word = matchSubstring("x ab", "ab")?.score ?? 0;
-    const partial = matchSubstring("xab", "ab")?.score ?? 0;
+    const exact = substringScore("ab", "ab");
+    const prefix = substringScore("abc", "ab");
+    const word = substringScore("x ab", "ab");
+    const partial = substringScore("xab", "ab");
     expect(exact).toBeGreaterThan(prefix);
     expect(prefix).toBeGreaterThan(word);
     expect(word).toBeGreaterThan(partial);
@@ -34,29 +36,25 @@ describe("matchSubstring", () => {
   });
 
   it("prefers shorter values within a band (coverage)", () => {
-    const short = matchSubstring("니아 봇", "니아")?.score ?? 0;
-    const long = matchSubstring("니아 tts 디스코드 봇", "니아")?.score ?? 0;
+    const short = substringScore("니아 봇", "니아");
+    const long = substringScore("니아 tts 디스코드 봇", "니아");
     expect(short).toBeGreaterThan(long);
   });
 
-  it("maps scores back to their match type", () => {
-    for (const [value, query] of [
-      ["ab", "ab"],
-      ["abc", "ab"],
-      ["x ab", "ab"],
-      ["xab", "ab"],
-    ] as const) {
-      const match = matchSubstring(value, query);
-      expect(matchTypeOf(match?.score ?? 0)).toBe(match?.type);
-    }
-    expect(matchTypeOf(fuzzyScore(0.5))).toBe("fuzzy");
+  it("keeps every band apart for any coverage", () => {
+    expect(matchTypeOf(substringScore("a".repeat(1000), "a"))).toBe("prefix");
+    expect(matchTypeOf(substringScore("ab", "a"))).toBe("prefix");
+    expect(matchTypeOf(substringScore("x a", "a"))).toBe("word");
+    expect(matchTypeOf(substringScore("xa", "a"))).toBe("partial");
+    expect(matchTypeOf(fuzzyScore(1))).toBe("fuzzy");
+    expect(matchTypeOf(fuzzyScore(0.01))).toBe("fuzzy");
   });
 });
 
-describe("matchField", () => {
+describe("fieldScore", () => {
   it("returns the best match across array values", () => {
-    expect(matchField(["니아봇", "니아"], "니아")?.type).toBe("exact");
-    expect(matchField(["검색"], "니아")).toBeUndefined();
+    expect(matchTypeOf(fieldScore(["니아봇", "니아"], "니아"))).toBe("exact");
+    expect(fieldScore(["검색"], "니아")).toBe(0);
   });
 });
 

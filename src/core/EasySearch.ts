@@ -10,7 +10,7 @@ import { type ResolvedProvider, resolveProvider } from "../providers/DataProvide
 import { normalizeText } from "../search/normalize.js";
 import type { AdvancedSettings, EasySearchOptions, SearchKey, SearchMode, SearchOptions } from "../types/options.js";
 import type { SearchResult } from "../types/results.js";
-import { type Hit, executeQuery, sortHits } from "./SearchEngine.js";
+import { type HitMatches, executeQuery, rankHits } from "./SearchEngine.js";
 import { type ResolvedKey, SearchIndex } from "./SearchIndex.js";
 
 const DEFAULT_CACHE_TTL = 60_000;
@@ -35,8 +35,10 @@ interface InFlightLoad<T> {
   promise: Promise<Snapshot<T>>;
 }
 
-/** Cached form of a search: `[item position, score, [key index, match type][]]`. */
-type CachedHit = [number, number, Hit["matches"]];
+/** A ranked search result before it is joined with the data, also the cached form: `[item position, score, matches]`. */
+type RankedHit = [number, number, HitMatches];
+
+const MATCH_TYPES = new Set<string>(["exact", "prefix", "word", "partial", "fuzzy"]);
 
 let instanceCounter = 0;
 
@@ -87,7 +89,7 @@ function isPayload(value: unknown): value is DataPayload<unknown> {
   );
 }
 
-function isCachedHits(value: unknown, size: number, keyCount: number): value is CachedHit[] {
+function isRankedHits(value: unknown, size: number, keyCount: number): value is RankedHit[] {
   if (!Array.isArray(value)) return false;
   return value.every(
     (hit) =>
@@ -98,7 +100,12 @@ function isCachedHits(value: unknown, size: number, keyCount: number): value is 
       typeof hit[1] === "number" &&
       Array.isArray(hit[2]) &&
       (hit[2] as unknown[]).every(
-        (match) => Array.isArray(match) && Number.isInteger(match[0]) && match[0] >= 0 && match[0] < keyCount,
+        (match) =>
+          Array.isArray(match) &&
+          Number.isInteger(match[0]) &&
+          match[0] >= 0 &&
+          match[0] < keyCount &&
+          MATCH_TYPES.has(match[1]),
       ),
   );
 }
@@ -210,23 +217,23 @@ export class EasySearch<T> {
     const engineQuery = { text, mode, activeKeys, maxEdits };
 
     if (filter === undefined && typeof sort !== "function") {
-      const compute = (): Hit[] => {
-        const hits = sortHits(executeQuery(index, engineQuery), sort);
-        return limit === undefined ? hits : hits.slice(0, limit);
+      const compute = (): RankedHit[] => {
+        const result = executeQuery(index, engineQuery);
+        return rankHits(result.hits, sort, limit).map(({ doc, score }) => [doc, score, result.matches(doc)]);
       };
-      const hits = await this.cachedHits(snapshot, engineQuery, sort, limit, compute);
-      return hits.map((hit) => this.toResult(index, hit));
+      const ranked = await this.cachedHits(snapshot, engineQuery, sort, limit, compute);
+      return ranked.map((hit) => this.toResult(index, hit));
     }
 
-    let hits = executeQuery(index, engineQuery);
+    const result = executeQuery(index, engineQuery);
+    let hits = result.hits;
     if (filter) hits = hits.filter((hit) => filter(index.items[hit.doc] as T));
     if (typeof sort === "function") {
-      const results = hits.map((hit) => this.toResult(index, hit));
+      const results = hits.map(({ doc, score }) => this.toResult(index, [doc, score, result.matches(doc)]));
       results.sort((a, b) => sort(a, b) || a.refIndex - b.refIndex);
       return limit === undefined ? results : results.slice(0, limit);
     }
-    sortHits(hits, sort);
-    return (limit === undefined ? hits : hits.slice(0, limit)).map((hit) => this.toResult(index, hit));
+    return rankHits(hits, sort, limit).map(({ doc, score }) => this.toResult(index, [doc, score, result.matches(doc)]));
   }
 
   /**
@@ -285,12 +292,12 @@ export class EasySearch<T> {
     return [...active].sort((a, b) => a - b);
   }
 
-  private toResult(index: SearchIndex<T>, hit: Hit): SearchResult<T> {
+  private toResult(index: SearchIndex<T>, [doc, score, matches]: RankedHit): SearchResult<T> {
     return {
-      item: index.items[hit.doc] as T,
-      refIndex: index.refIndexes[hit.doc] as number,
-      score: hit.score,
-      matches: hit.matches.map(([key, type]) => ({ key: (index.keys[key] as ResolvedKey).name, type })),
+      item: index.items[doc] as T,
+      refIndex: index.refIndexes[doc] as number,
+      score,
+      matches: matches.map(([key, type]) => ({ key: (index.keys[key] as ResolvedKey).name, type })),
     };
   }
 
@@ -434,8 +441,8 @@ export class EasySearch<T> {
     query: { text: string; mode: SearchMode; activeKeys: readonly number[]; maxEdits: number | undefined },
     sort: "relevance" | "original",
     limit: number | undefined,
-    compute: () => Hit[],
-  ): Promise<Hit[]> {
+    compute: () => RankedHit[],
+  ): Promise<RankedHit[]> {
     // Without a cached data load, `reloadOnSearch` creates a new version per search: results would never be reused.
     const versionIsStable = !this.settings.reloadOnSearch || !this.provider.isStatic;
     if (!this.cacheEnabled || !versionIsStable) return compute();
@@ -448,14 +455,8 @@ export class EasySearch<T> {
     // A missing `layercache` package is a configuration error and is not swallowed.
     const cache = await this.getCache();
     try {
-      const cached = await cache.get<CachedHit[]>(
-        key,
-        async () => compute().map((hit): CachedHit => [hit.doc, hit.score, hit.matches]),
-        this.entryOptions(),
-      );
-      if (isCachedHits(cached, index.size, index.keyCount)) {
-        return cached.map(([doc, score, matches]) => ({ doc, score, matches }));
-      }
+      const cached = await cache.get<RankedHit[]>(key, async () => compute(), this.entryOptions());
+      if (isRankedHits(cached, index.size, index.keyCount)) return cached;
       this.report(new Error(`EasySearch: ignoring malformed cache entry "${key}".`));
     } catch (error) {
       this.report(error);

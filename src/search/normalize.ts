@@ -2,10 +2,10 @@ export interface NormalizeOptions {
   ignoreDiacritics: boolean;
 }
 
-const WHITESPACE = /\s+/gu;
+const WHITESPACE = /\s+/g;
 const COMBINING_MARKS = /\p{M}/gu;
-/** Maximal runs of letters, digits and combining marks. Everything else separates words. */
-const WORD = /[\p{L}\p{N}\p{M}]+/gu;
+/** ASCII and precomposed Hangul syllables are already in NFKC form. */
+const NFKC_STABLE = /^[\u0000-\u007f\uac00-\ud7a3]*$/;
 const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
 
 /**
@@ -14,27 +14,79 @@ const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
  * whitespace.
  */
 export function normalizeText(value: string, options: NormalizeOptions): string {
-  let text = value.normalize("NFKC").toLowerCase();
+  let text = (NFKC_STABLE.test(value) ? value : value.normalize("NFKC")).toLowerCase();
   if (options.ignoreDiacritics) {
     // NFD splits Hangul syllables into conjoining jamo (letters, not marks), so recompose afterwards.
     text = text.normalize("NFD").replace(COMBINING_MARKS, "").normalize("NFC");
   }
-  return text.replace(WHITESPACE, " ").trim();
+  return hasIrregularWhitespace(text) ? text.replace(WHITESPACE, " ").trim() : text;
 }
 
-/** Splits normalized text into words. */
+/** Whether `text` has whitespace other than single spaces between non-space characters (JavaScript `\s`). */
+function hasIrregularWhitespace(text: string): boolean {
+  const last = text.length - 1;
+  for (let i = 0; i <= last; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x20) {
+      if (i === 0 || i === last || text.charCodeAt(i + 1) === 0x20) return true;
+    } else if (code < 0x20) {
+      if (code >= 0x09 && code <= 0x0d) return true;
+    } else if (
+      code >= 0xa0 &&
+      (code === 0xa0 ||
+        code === 0x1680 ||
+        (code >= 0x2000 && code <= 0x200a) ||
+        code === 0x2028 ||
+        code === 0x2029 ||
+        code === 0x202f ||
+        code === 0x205f ||
+        code === 0x3000 ||
+        code === 0xfeff)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Letters, digits and combining marks form words; everything else separates
+ * them. ASCII and Hangul syllables are classified without a regular expression.
+ */
+function isWordCodePoint(code: number): boolean {
+  if (code < 0x80) return (code >= 0x61 && code <= 0x7a) || (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a);
+  if (code >= 0xac00 && code <= 0xd7a3) return true;
+  return WORD_CHAR.test(String.fromCodePoint(code));
+}
+
+/** Splits normalized text into words (maximal runs of word characters). */
 export function tokenize(text: string): string[] {
-  return text.match(WORD) ?? [];
+  const words: string[] = [];
+  let start = -1;
+  for (let i = 0; i < text.length; ) {
+    const code = text.codePointAt(i) as number;
+    if (isWordCodePoint(code)) {
+      if (start === -1) start = i;
+    } else if (start !== -1) {
+      words.push(text.slice(start, i));
+      start = -1;
+    }
+    i += code > 0xffff ? 2 : 1;
+  }
+  if (start !== -1) words.push(text.slice(start));
+  return words;
 }
 
 /** Whether the character before `index` separates words (or `index` is the start). */
 export function isWordStart(text: string, index: number): boolean {
   if (index === 0) return true;
-  // Surrogate pairs: look at the full code point that ends right before `index`.
-  const prev = text.codePointAt(index - 1);
-  const low = prev !== undefined && prev >= 0xdc00 && prev <= 0xdfff && index >= 2;
-  const ch = low ? String.fromCodePoint(text.codePointAt(index - 2) ?? 0) : text.charAt(index - 1);
-  return !WORD_CHAR.test(ch);
+  let code = text.charCodeAt(index - 1);
+  // The previous character may be the second half of a surrogate pair.
+  if (code >= 0xdc00 && code <= 0xdfff && index >= 2) {
+    const high = text.charCodeAt(index - 2);
+    if (high >= 0xd800 && high <= 0xdbff) code = text.codePointAt(index - 2) as number;
+  }
+  return !isWordCodePoint(code);
 }
 
 const HANGUL_BASE = 0xac00;
