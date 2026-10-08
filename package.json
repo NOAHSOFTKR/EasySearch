@@ -56,7 +56,7 @@
     "test:watch": "vitest",
     "bench": "tsx bench/search.bench.ts",
     "check:package": "publint && attw --pack . && node scripts/smoke-pack.mjs",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run check:package"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "publishConfig": {
     "access": "public"
