@@ -1,0 +1,47 @@
+# Draft: publishes to npm when a GitHub release is published.
+# Before enabling: create the `npm` environment with required reviewers,
+# add an NPM_TOKEN secret (automation token) to it, and make sure the
+# @noahsoft scope exists on npm and the token can publish to it.
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Run npm publish --dry-run only"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Validate package (publint, are-the-types-wrong, install smoke test)
+        run: npm run check:package
+      - name: Check that the tag matches package.json
+        if: github.event_name == 'release'
+        run: test "v$(node -p "require('./package.json').version")" = "${{ github.event.release.tag_name }}"
+      # prepublishOnly runs typecheck, tests and build again right before packing.
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+        run: npm publish --dry-run
+      - name: Publish
+        if: github.event_name == 'release' || !inputs.dry-run
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
